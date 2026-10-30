@@ -1,0 +1,1677 @@
+import {
+  test,
+  expect,
+  Page,
+  FrameLocator,
+  Locator,
+  TestInfo,
+} from '@playwright/test';
+import fs from 'fs';
+import path from 'path';
+import { env } from '../../config/env';
+import { getRandomAccountName } from '../../utils/account';
+
+/* ------------------------------------------------------------------ */
+/* Config / small utilities                                            */
+/* ------------------------------------------------------------------ */
+
+// SCREENSHOTS=off disables screenshots; FULL_PAGE_SCREENSHOTS=true restores fullPage captures.
+const SCREENSHOTS_ENABLED = process.env.SCREENSHOTS !== 'off';
+const FULL_PAGE_SCREENSHOTS = process.env.FULL_PAGE_SCREENSHOTS === 'true';
+
+const ACCOUNT_VIEW_URL = '**/lightning/r/Account/**/view';
+const VF_FRAME = 'iframe[name^="vfFrameId_"]';
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const isVisible = (locator: Locator) =>
+  locator.isVisible().catch(() => false);
+
+/** Resolves with the key of the first condition that succeeds, or null if all fail. */
+function waitForOutcome<K extends string>(
+  conditions: Record<K, () => Promise<unknown>>
+): Promise<K | null> {
+  const entries = Object.entries(conditions) as [K, () => Promise<unknown>][];
+  return new Promise((resolve) => {
+    let pending = entries.length;
+    for (const [key, run] of entries) {
+      run()
+        .then(() => resolve(key))
+        .catch(() => {
+          if (--pending === 0) resolve(null);
+        });
+    }
+  });
+}
+
+async function captureScreenshot(
+  page: Page,
+  testInfo: TestInfo,
+  label: string
+): Promise<void> {
+  if (!SCREENSHOTS_ENABLED) return;
+
+  const body = await page.screenshot({ fullPage: FULL_PAGE_SCREENSHOTS });
+  await testInfo.attach(label, { body, contentType: 'image/png' });
+  console.log(`Screenshot captured (${label})`);
+}
+
+/* ------------------------------------------------------------------ */
+/* CSV helpers (parsed once, cached)                                   */
+/* ------------------------------------------------------------------ */
+
+function parseCsvLine(line: string): string[] {
+  const values: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      values.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current.trim());
+  return values;
+}
+
+type CsvRow = Record<string, string>;
+const csvCache = new Map<string, CsvRow[]>();
+
+function readCsv(fileName: string, label: string): CsvRow[] {
+  const cached = csvCache.get(fileName);
+  if (cached) return cached;
+
+  const csvPath = path.resolve(process.cwd(), 'test-data', fileName);
+
+  if (!fs.existsSync(csvPath)) {
+    throw new Error(`${label} CSV file not found: ${csvPath}`);
+  }
+
+  const lines = fs
+    .readFileSync(csvPath, 'utf8')
+    .split(/\r?\n/)
+    .filter((line) => line.trim());
+
+  if (lines.length < 2) {
+    throw new Error(`${fileName} contains no ${label} rows.`);
+  }
+
+  const headers = parseCsvLine(lines[0]);
+
+  const rows = lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    const row: CsvRow = {};
+    headers.forEach((header, index) => {
+      row[header] = values[index]?.trim() ?? '';
+    });
+    return row;
+  });
+
+  csvCache.set(fileName, rows);
+  return rows;
+}
+
+interface AccountCsvRecord {
+  accountName: string;
+  billingCountry: string;
+  billingStreet: string;
+  billingCity: string;
+  billingState: string;
+  billingPostalCode: string;
+}
+
+function getAccountCsvRecord(accountName: string): AccountCsvRecord {
+  const rows = readCsv('salesfrocedataauto.csv', 'Account');
+
+  const match = rows.find(
+    (row) =>
+      (row['forseva1__Account__r.Name'] || '').trim().toLowerCase() ===
+      accountName.trim().toLowerCase()
+  );
+
+  if (!match) {
+    throw new Error(`CSV data was not found for account "${accountName}".`);
+  }
+
+  return {
+    accountName: match['forseva1__Account__r.Name']?.trim() || accountName,
+    billingCountry: match['forseva1__Account__r.BillingCountry']?.trim() || '',
+    billingStreet: match['forseva1__Address1__c']?.trim() || '',
+    billingCity: match['forseva1__Account__r.BillingCity']?.trim() || '',
+    billingState: match['forseva1__Account__r.BillingState']?.trim() || '',
+    billingPostalCode:
+      match['forseva1__Account__r.BillingPostalCode']?.trim() || '',
+  };
+}
+
+type ContactCsvRecord = Record<string, string>;
+
+function readContactsForAccount(accountName: string): ContactCsvRecord[] {
+  const contacts = readCsv('salesfrocedataauto2.csv', 'Contact').filter(
+    (contact) =>
+      (contact['Account.Name']?.trim() || '').toLowerCase() ===
+      accountName.trim().toLowerCase()
+  );
+
+  console.log(
+    `Contact CSV rows found for "${accountName}": ${contacts.length}`
+  );
+
+  return contacts;
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared page helpers                                                 */
+/* ------------------------------------------------------------------ */
+
+function accountHeading(
+  page: Page,
+  accountName: string
+): Locator {
+  return page.getByRole('heading', {
+    name: new RegExp(
+      `^${escapeRegExp(accountName)}$`,
+      'i'
+    ),
+  });
+}
+
+async function waitForAccountPage(
+  page: Page,
+  accountName: string,
+  timeout = 30000
+): Promise<void> {
+  await expect(accountHeading(page, accountName)).toBeVisible({ timeout });
+}
+
+/** From a related-list page, click the Account breadcrumb link and wait for the record. */
+async function returnToAccount(
+  page: Page,
+  accountName: string
+): Promise<void> {
+  const link = page
+    .getByRole('link', { name: accountName, exact: true })
+    .first();
+
+  await expect(link).toBeVisible({ timeout: 30000 });
+  await link.click();
+  await waitForAccountPage(page, accountName);
+}
+
+/** Click an Account action that may be a visible button or inside "Show more actions". */
+async function clickAccountAction(page: Page, name: RegExp): Promise<void> {
+  const showMore = page.getByRole('button', { name: /show more actions/i });
+
+  await expect(showMore).toBeVisible({ timeout: 30000 });
+
+  const action = page
+    .getByRole('button', { name })
+    .or(page.getByRole('menuitem', { name }))
+    .or(page.locator('a').filter({ hasText: name }))
+    .first();
+
+  if (!(await isVisible(action))) {
+    await showMore.click();
+  }
+
+  await expect(action).toBeVisible({ timeout: 30000 });
+  await action.click();
+}
+
+function getVfFrame(page: Page): { element: Locator; frame: FrameLocator } {
+  const element = page.locator(`${VF_FRAME}:visible`).last();
+  return { element, frame: element.contentFrame() };
+}
+
+/* ------------------------------------------------------------------ */
+/* Login                                                               */
+/* ------------------------------------------------------------------ */
+
+async function isSubscriberAccountPage(page: Page): Promise<boolean> {
+  return /\/lightning\/(r|o)\/Account\//i.test(page.url());
+}
+
+async function loginToSalesforce(page: Page): Promise<Page> {
+  console.log('Navigating to LMA...');
+
+  await page.goto(env.baseUrl!, { waitUntil: 'domcontentloaded' });
+
+  // Already inside the subscriber org - skip the complete LMA flow.
+  if (await isSubscriberAccountPage(page)) {
+    console.log('Subscriber org session already available.');
+    return page;
+  }
+
+  const usernameField = page.locator('#username');
+
+  if (await isVisible(usernameField)) {
+    await usernameField.fill(env.username!);
+    await page.locator('#Login').click();
+
+    const passwordField = page.locator('#password');
+    await expect(passwordField).toBeVisible({ timeout: 60000 });
+    await passwordField.fill(env.password!);
+    await page.locator('#Login').click();
+
+    console.log('LMA login submitted.');
+  } else {
+    console.log('Existing LMA session detected.');
+  }
+
+  // LMA opens in Salesforce Classic - do not wait for a /lightning/ URL here.
+  const subscribersTab = page.getByRole('link', { name: /^Subscribers$/i });
+  await expect(subscribersTab).toBeVisible({ timeout: 120000 });
+  await subscribersTab.click();
+  console.log('Subscribers tab opened.');
+
+  await expect(
+    page.getByText('Subscriber Organizations', { exact: true })
+  ).toBeVisible({ timeout: 30000 });
+
+  // First textbox = global search; last = Subscriber list search.
+  const textboxes = page.getByRole('textbox');
+  await expect
+    .poll(() => textboxes.count(), { timeout: 30000, intervals: [250, 500] })
+    .toBeGreaterThanOrEqual(2);
+
+  const subscriberSearch = textboxes.last();
+  await expect(subscriberSearch).toBeVisible({ timeout: 30000 });
+  await subscriberSearch.fill(env.subscriberOrgId!);
+  await subscriberSearch.press('Enter');
+  console.log(`Subscriber Org searched: ${env.subscriberOrgId}`);
+
+  const ascendionLink = page.getByRole('link', {
+    name: /^Ascendion Engineering Private Limited$/i,
+  });
+  await expect(ascendionLink).toBeVisible({ timeout: 30000 });
+
+  const [overviewPage] = await Promise.all([
+    page.context().waitForEvent('page'),
+    ascendionLink.click(),
+  ]);
+  await overviewPage.waitForLoadState('domcontentloaded');
+  console.log('Overview URL:', overviewPage.url());
+
+  await expect(overviewPage.locator('body')).toContainText(
+    'Login Access Granted',
+    { timeout: 30000 }
+  );
+  console.log('Ascendion Subscriber Overview opened.');
+
+  // Pick the Login link for the intended subscriber username (if provided).
+  const subscriberLoginUsername = process.env.SUBSCRIBER_LOGIN_USERNAME;
+  let loginLink: Locator;
+
+  if (subscriberLoginUsername) {
+    const loginRow = overviewPage
+      .getByRole('row')
+      .filter({ hasText: subscriberLoginUsername });
+
+    await expect(loginRow).toBeVisible({ timeout: 30000 });
+    loginLink = loginRow.getByRole('link', { name: /^Login$/i });
+  } else {
+    const loginLinks = overviewPage.getByRole('link', { name: /^Login$/i });
+    const count = await loginLinks.count();
+    console.log(`Subscriber Login links found: ${count}`);
+
+    if (count === 0) {
+      throw new Error('No subscriber Login link was found.');
+    }
+    loginLink = loginLinks.first();
+  }
+
+  await expect(loginLink).toBeVisible({ timeout: 30000 });
+
+  // Subscriber Login may open a new page or reuse the same one.
+  // Wait for whichever happens first instead of a fixed 3 second sleep.
+  const context = overviewPage.context();
+  const pagesBeforeLogin = context.pages();
+  const overviewUrlBeforeLogin = overviewPage.url();
+
+  const outcome = waitForOutcome({
+    newPage: () => context.waitForEvent('page', { timeout: 30000 }),
+    sameTab: () =>
+      overviewPage.waitForURL((url) => url.toString() !== overviewUrlBeforeLogin, {
+        timeout: 30000,
+      }),
+  });
+
+  await loginLink.click();
+  await outcome;
+
+  const subscriberPage =
+    context.pages().find((candidate) => !pagesBeforeLogin.includes(candidate)) ||
+    overviewPage;
+
+  await subscriberPage.waitForLoadState('domcontentloaded');
+  console.log('Subscriber URL after Login:', subscriberPage.url());
+
+  // Subscriber login may open Classic - go straight to Lightning Accounts.
+  const subscriberOrigin = new URL(subscriberPage.url()).origin;
+
+  await subscriberPage.goto(
+    `${subscriberOrigin}/lightning/o/Account/list?filterName=__Recent`,
+    { waitUntil: 'domcontentloaded' }
+  );
+
+  await subscriberPage.waitForURL('**/lightning/o/Account/**', {
+    timeout: 120000,
+  });
+
+  await expect(
+    subscriberPage.getByRole('link', { name: /^Accounts$/i })
+  ).toBeVisible({ timeout: 60000 });
+
+  console.log('Subscriber Lightning Accounts page loaded:', subscriberPage.url());
+
+  return subscriberPage;
+}
+
+/* ------------------------------------------------------------------ */
+/* Accounts                                                            */
+/* ------------------------------------------------------------------ */
+
+async function waitForAccountsList(page: Page): Promise<void> {
+  console.log('Waiting for Accounts list to load...');
+
+  const listViewToggle = page
+    .locator('button, a')
+    .filter({ hasText: /Recently Viewed|Select a List View/i })
+    .first();
+
+  await expect(listViewToggle).toBeVisible({ timeout: 30000 });
+  await listViewToggle.click();
+
+  const allAccountsOption = page
+    .locator('lightning-menu-item, lightning-button-menu-item, li, a, button')
+    .filter({ hasText: /^All Accounts$/i })
+    .first();
+
+  await expect(allAccountsOption).toBeVisible({ timeout: 15000 });
+  await allAccountsOption.click();
+  console.log('All Accounts selected.');
+
+  // The caller waits on the search box, so no fixed sleep is needed here.
+}
+
+async function selectPicklistOption(
+  page: Page,
+  combobox: Locator,
+  value: string,
+  label: string
+): Promise<void> {
+  await expect(combobox).toBeVisible({ timeout: 30000 });
+  await combobox.click();
+
+  const option = page.getByRole('option', { name: value, exact: true });
+  await expect(option).toBeVisible({ timeout: 15000 });
+  await option.click();
+
+  console.log(`${label} selected: ${value}`);
+}
+
+/** Returns true when a new Account was created, false when an existing one was opened. */
+async function searchAccountAndOpen(
+  page: Page,
+  accountName: string
+): Promise<boolean> {
+  await waitForAccountsList(page);
+
+  console.log(`Searching for random account: ${accountName}`);
+
+  const escapedAccountName = escapeRegExp(accountName);
+
+  const searchBox = page
+    .locator('input[placeholder="Search this list..."]')
+    .or(page.getByRole('searchbox', { name: /search this list/i }))
+    .first();
+
+  await expect(searchBox).toBeVisible({ timeout: 30000 });
+  await searchBox.fill(accountName);
+  await searchBox.press('Enter');
+
+  const accountLink = page
+    .getByRole('link', { name: new RegExp(`^${escapedAccountName}$`, 'i') })
+    .first();
+  const emptyState = page.getByText(/No items to display/i).first();
+
+  // Resolve as soon as either the account or the empty state appears.
+  const searchResult = await waitForOutcome({
+    found: () => accountLink.waitFor({ state: 'visible', timeout: 1000 }),
+    empty: () => emptyState.waitFor({ state: 'visible', timeout: 1000 }),
+  });
+
+  if (searchResult === 'found') {
+    console.log(`Account found: ${accountName}`);
+    await accountLink.click();
+    await waitForAccountPage(page, accountName);
+    console.log(`Existing Account opened: ${accountName}`);
+    return false;
+  }
+
+  console.log(`Account not found. Creating Account: ${accountName}`);
+
+  const accountData = getAccountCsvRecord(accountName);
+
+  // Clear the list search so the Accounts list is restored before clicking New.
+  await searchBox.fill('');
+  await searchBox.press('Enter');
+
+  const newAccountButton = page
+    .getByRole('button', { name: /^New$/i })
+    .first();
+
+  const accountNameField = page.locator(
+    'input[name="Name"]'
+  );
+
+  await Promise.all([
+    accountNameField.waitFor({
+      state: 'visible',
+      timeout: 30000
+    }),
+    newAccountButton.click()
+  ]);
+  await accountNameField.fill(
+    accountData.accountName
+  );
+
+  console.log(
+    `Account Name entered: ${accountData.accountName}`
+  );
+  console.log('Account Name entered.');
+
+  if (accountData.billingCountry) {
+    await selectPicklistOption(
+      page,
+      page.getByRole('combobox', { name: /^Billing Country$/i }),
+      accountData.billingCountry,
+      'Billing Country'
+    );
+  }
+
+  const textFields: [string, string][] = [
+    ['Billing Street', accountData.billingStreet],
+    ['Billing City', accountData.billingCity],
+  ];
+
+  for (const [label, value] of textFields) {
+    if (value) {
+      await page.getByLabel(label, { exact: true }).fill(value, { timeout: 30000 });
+    }
+  }
+
+  if (accountData.billingState) {
+    await selectPicklistOption(
+      page,
+      page.getByRole('combobox', { name: /^Billing State\/Province$/i }),
+      accountData.billingState,
+      'Billing State'
+    );
+  }
+
+  if (accountData.billingPostalCode) {
+    await page
+      .getByLabel('Billing Zip/Postal Code', { exact: true })
+      .fill(accountData.billingPostalCode, { timeout: 30000 });
+  }
+
+  // expect(await accountNameField.inputValue()).toBe(accountData.accountName);
+
+  const saveButton = page.locator('button[name="SaveEdit"]');
+  await expect(saveButton).toBeEnabled({ timeout: 30000 });
+  await saveButton.click();
+
+  // Duplicate warning vs. successful navigation - whichever comes first.
+  const duplicatePopup = page
+    .locator('div[role="dialog"]')
+    .filter({ hasText: /Similar Records Exist|Duplicate/i })
+    .first();
+
+  const saveOutcome = await waitForOutcome({
+    duplicate: () => duplicatePopup.waitFor({ state: 'visible', timeout: 60000 }),
+    saved: () => page.waitForURL(ACCOUNT_VIEW_URL, { timeout: 60000 }),
+  });
+
+  if (saveOutcome === 'duplicate') {
+    throw new Error(
+      `Salesforce detected a duplicate Account for "${accountName}".`
+    );
+  }
+
+  await waitForAccountPage(page, accountName, 60000);
+
+  console.log(`New Account created and opened: ${accountName}`);
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Contacts                                                            */
+/* ------------------------------------------------------------------ */
+
+async function openContactsList(
+  page: Page,
+  subscriberOrigin: string
+): Promise<void> {
+  await page.goto(
+    `${subscriberOrigin}/lightning/o/Contact/list?filterName=__Recent`,
+    {
+      waitUntil: 'domcontentloaded',
+    }
+  );
+
+  await page.waitForURL(
+    '**/lightning/o/Contact/**',
+    {
+      timeout: 60000,
+    }
+  );
+
+  await expect(
+    page.getByRole('link', {
+      name: /^Contacts$/i,
+    })
+  ).toBeVisible({
+    timeout: 60000,
+  });
+
+  const listViewDropdown = page
+    .locator(
+      'button[title*="Select a List View"]'
+    )
+    .first();
+
+  await expect(
+    listViewDropdown
+  ).toBeVisible({
+    timeout: 30000,
+  });
+
+  await listViewDropdown.click();
+
+  const allContactsOption = page
+    .getByText(
+      'All Contacts',
+      {
+        exact: true,
+      }
+    )
+    .first();
+
+  await expect(
+    allContactsOption
+  ).toBeVisible({
+    timeout: 15000,
+  });
+
+  await allContactsOption.click();
+
+  /*
+   * Wait for Salesforce to apply the selected list view.
+   */
+  await expect(
+    page.locator(
+      'input[placeholder="Search this list..."]'
+    ).first()
+  ).toBeVisible({
+    timeout: 30000,
+  });
+
+  console.log(
+    'All Contacts selected.'
+  );
+
+  // Wait for the list search box instead of a fixed 2 second sleep.
+  await expect(
+    page.locator('input[placeholder="Search this list..."]').first()
+  ).toBeVisible({ timeout: 30000 });
+}
+
+async function selectContactComboboxValue(
+  page: Page,
+  input: Locator,
+  value: string,
+  label: string
+): Promise<void> {
+  if (!value) return;
+
+  await expect(input).toBeVisible({ timeout: 30000 });
+  await input.click();
+
+  await input.press('Control+A').catch(() => undefined);
+  await input.press('Backspace').catch(() => undefined);
+  await input.pressSequentially(
+    value,
+    {
+      delay: 30,
+    }
+  );
+
+  const listboxId = await input.getAttribute('aria-controls').catch(() => null);
+
+  const listbox = listboxId
+    ? page.locator(`#${listboxId}`)
+    : page.locator('[role="listbox"]:visible').first();
+
+  await expect(listbox).toBeVisible({ timeout: 15000 });
+
+  const options = listbox.getByRole('option');
+  const exactOption = options.filter({
+    hasText: new RegExp(`^${escapeRegExp(value)}$`, 'i'),
+  });
+
+  const optionToSelect =
+    (await exactOption.count()) > 0
+      ? exactOption.first()
+      : options
+        .filter({ hasText: new RegExp(escapeRegExp(value), 'i') })
+        .first();
+
+  await expect(optionToSelect).toBeVisible({ timeout: 10000 });
+  await optionToSelect.click();
+
+  console.log(`${label} selected: ${value}`);
+}
+
+function contactFullName(contact: ContactCsvRecord): string {
+  return `${contact['FirstName']?.trim() || ''} ${contact['LastName']?.trim() || ''}`.trim();
+}
+
+async function contactExistsForAccount(
+  page: Page,
+  contact: ContactCsvRecord
+): Promise<boolean> {
+  const fullName = contactFullName(contact);
+  const accountName = contact['Account.Name']?.trim() || '';
+
+  const searchBox = page
+    .locator('input[placeholder="Search this list..."]')
+    .first();
+
+  await expect(searchBox).toBeVisible({ timeout: 30000 });
+  await searchBox.fill(fullName);
+  await searchBox.press('Enter');
+
+  const matchingRow = page
+    .getByRole('row')
+    .filter({
+      has: page.getByRole('link', { name: fullName, exact: true }),
+    })
+    .filter({ hasText: accountName })
+    .first();
+
+  const emptyState = page.getByText(/No items to display/i).first();
+
+  // Resolve as soon as a matching row or the empty state appears.
+  const result = await waitForOutcome({
+    found: () => matchingRow.waitFor({ state: 'visible', timeout: 1000 }),
+    empty: () => emptyState.waitFor({ state: 'visible', timeout: 1000 }),
+  });
+
+  const exists = result === 'found';
+
+  console.log(
+    `Contact check: ${fullName} | Account: ${accountName} | Exists: ${exists}`
+  );
+
+  await searchBox.fill('');
+  await searchBox.press('Enter');
+
+  return exists;
+}
+
+async function fillTextbox(
+  dialog: Locator,
+  name: RegExp,
+  value: string,
+  optional = false
+): Promise<void> {
+  if (!value) return;
+
+  const field = dialog.getByRole('textbox', { name }).first();
+
+  if (optional && !(await isVisible(field))) return;
+
+  await field.fill(value, { timeout: 30000 });
+}
+
+async function closeDuplicateDialog(duplicateDialog: Locator): Promise<void> {
+  const cancelButton = duplicateDialog
+    .getByRole('button', { name: /^Cancel$/i })
+    .first();
+
+  if (await isVisible(cancelButton)) {
+    await cancelButton.click();
+    return;
+  }
+
+  const closeButton = duplicateDialog
+    .locator('button[title="Close"], button[aria-label="Close"]')
+    .first();
+
+  if (await isVisible(closeButton)) {
+    await closeButton.click();
+  }
+}
+
+async function createSingleContact(
+  page: Page,
+  contact: ContactCsvRecord
+): Promise<void> {
+  const firstName = contact['FirstName']?.trim() || '';
+  const lastName = contact['LastName']?.trim() || '';
+  const accountName = contact['Account.Name']?.trim() || '';
+  const fullName = contactFullName(contact);
+
+  if (!lastName) {
+    throw new Error(
+      `Last Name is missing in the Contact CSV row for Account "${accountName}".`
+    );
+  }
+
+  const newButton = page
+    .getByRole('button', { name: /^New$/i })
+    .or(page.getByRole('link', { name: /^New$/i }))
+    .first();
+
+  await expect(newButton).toBeVisible({ timeout: 30000 });
+  await newButton.click();
+
+  const contactDialog = page
+    .getByRole('dialog', { name: /^New Contact$/i })
+    .first();
+
+  await expect(contactDialog).toBeVisible({ timeout: 30000 });
+
+  await fillTextbox(contactDialog, /^First Name$/i, firstName);
+  await fillTextbox(contactDialog, /^Last Name$/i, lastName);
+  console.log(`Contact Name entered: ${fullName}`);
+
+  await selectContactComboboxValue(
+    page,
+    contactDialog.getByRole('combobox', { name: /^Account Name$/i }).first(),
+    accountName,
+    'Account Name'
+  );
+
+  await selectContactComboboxValue(
+    page,
+    contactDialog.getByRole('combobox', { name: /^Mailing Country$/i }).first(),
+    contact['MailingCountry']?.trim() || '',
+    'Mailing Country'
+  );
+
+  await fillTextbox(contactDialog, /^Mailing Street$/i, contact['MailingStreet']?.trim() || '');
+  await fillTextbox(contactDialog, /^Mailing City$/i, contact['MailingCity']?.trim() || '');
+
+  await selectContactComboboxValue(
+    page,
+    contactDialog
+      .getByRole('combobox', { name: /^Mailing State\/Province$/i })
+      .first(),
+    contact['MailingState']?.trim() || '',
+    'Mailing State/Province'
+  );
+
+  await fillTextbox(
+    contactDialog,
+    /^Mailing Zip\/Postal Code$/i,
+    contact['MailingPostalCode']?.trim() || ''
+  );
+
+  await fillTextbox(
+    contactDialog,
+    /^SSN$/i,
+    contact['SSN__c']?.trim() || contact['SSN']?.trim() || ''
+  );
+
+  // Optional fields - skipped silently if the layout does not show them.
+  await fillTextbox(contactDialog, /^Phone$/i, contact['Phone']?.trim() || '', true);
+  await fillTextbox(contactDialog, /^Mobile$/i, contact['MobilePhone']?.trim() || '', true);
+  await fillTextbox(contactDialog, /^Email$/i, contact['Email']?.trim() || '', true);
+  await fillTextbox(contactDialog, /^Title$/i, contact['Title']?.trim() || '', true);
+  await fillTextbox(contactDialog, /^Department$/i, contact['Department']?.trim() || '', true);
+
+  const saveButton = contactDialog.getByRole('button', { name: /^Save$/i }).first();
+  await expect(saveButton).toBeEnabled({ timeout: 30000 });
+  await saveButton.click();
+  console.log(`Save clicked for Contact: ${fullName}`);
+
+  // Duplicate warning vs. modal closing - whichever comes first (no fixed 5s wait).
+  const duplicateDialog = page
+    .getByRole('dialog')
+    .filter({ hasText: /Similar Records Exist|duplicate/i })
+    .last();
+
+  const saveOutcome = await waitForOutcome({
+    duplicate: () => duplicateDialog.waitFor({ state: 'visible', timeout: 60000 }),
+    saved: () => contactDialog.waitFor({ state: 'hidden', timeout: 60000 }),
+  });
+
+  if (saveOutcome === 'duplicate') {
+    console.log(`Duplicate Contact detected: ${fullName}`);
+    await closeDuplicateDialog(duplicateDialog);
+    console.log(`Duplicate Contact skipped: ${fullName}`);
+    return;
+  }
+
+  console.log(`Contact created: ${fullName} | Account: ${accountName}`);
+}
+
+async function createContactsForAccount(
+  page: Page,
+  accountName: string,
+  accountUrl: string
+): Promise<void> {
+  const contacts = readContactsForAccount(accountName);
+
+  if (contacts.length === 0) {
+    console.log(
+      `No Contact CSV rows found for newly created Account "${accountName}".`
+    );
+    await page.goto(accountUrl, { waitUntil: 'domcontentloaded' });
+    return;
+  }
+
+  const subscriberOrigin = new URL(accountUrl).origin;
+
+  // 1) Check every CSV contact in a single visit to the list.
+  await openContactsList(page, subscriberOrigin);
+
+  const missingContacts: ContactCsvRecord[] = [];
+  const seen = new Set<string>();
+
+  for (const contact of contacts) {
+    const fullName = contactFullName(contact);
+    const key = fullName.toLowerCase();
+
+    if (seen.has(key)) {
+      console.log(`Contact already exists. Skipping: ${fullName}`);
+      continue;
+    }
+    seen.add(key);
+
+    if (await contactExistsForAccount(page, contact)) {
+      console.log(`Contact already exists. Skipping: ${fullName}`);
+    } else {
+      missingContacts.push(contact);
+    }
+  }
+
+  // 2) Create only the missing ones.
+  for (let i = 0; i < missingContacts.length; i++) {
+    if (i > 0) {
+      // Creating a Contact navigates away from the list - reopen it.
+      await openContactsList(page, subscriberOrigin);
+    }
+    await createSingleContact(page, missingContacts[i]);
+  }
+
+  // Return to the Account so the Review Credit flow can continue.
+  await page.goto(accountUrl, { waitUntil: 'domcontentloaded' });
+  await waitForAccountPage(page, accountName, 60000);
+
+  console.log(`Contact creation/check completed for Account: ${accountName}`);
+}
+
+/* ------------------------------------------------------------------ */
+/* Reports                                                             */
+/* ------------------------------------------------------------------ */
+
+async function waitForCreditReportPage(frame: FrameLocator): Promise<void> {
+  const heading = frame
+    .getByRole('heading', { name: /request .*credit reports/i })
+    .or(frame.getByText(/request .*credit reports/i))
+    .or(frame.getByRole('button', { name: /request reports/i }))
+    .first();
+
+  await expect(heading).toBeVisible({ timeout: 45000 });
+}
+
+async function openReportViewAll(
+  page: Page,
+  reportLabel: RegExp
+): Promise<void> {
+  console.log(`Opening ${reportLabel} View All...`);
+
+  const reportLink = page.getByRole('link', { name: reportLabel }).first();
+
+  // Related lists are lazy rendered - scroll until the link appears.
+  for (let i = 0; i < 24; i++) {
+    if (await isVisible(reportLink)) break;
+    await page.keyboard.press('PageDown');
+    await page.waitForTimeout(250);
+  }
+
+  await expect(reportLink).toBeVisible({ timeout: 30000 });
+  await reportLink.scrollIntoViewIfNeeded();
+  await reportLink.click();
+
+  await page.waitForURL('**/related/**/view', { timeout: 30000 });
+
+  await expect(page.getByRole('heading', { name: reportLabel })).toBeVisible({
+    timeout: 30000,
+  });
+
+  console.log(`${reportLabel} View All page loaded.`);
+}
+
+async function getReportCount(
+  page: Page,
+  reportType: 'Consumer' | 'Commercial'
+): Promise<number> {
+  const reportStatus = page.getByRole('status', {
+    name:
+      reportType === 'Consumer'
+        ? 'Equifax Consumer Reports'
+        : 'Equifax Commercial Reports',
+  });
+
+  await expect(reportStatus).toBeVisible({ timeout: 30000 });
+
+  const statusText = (await reportStatus.textContent())?.trim() || '';
+  const countMatch = statusText.match(/(\d+)\s+items?/i);
+
+  if (!countMatch) {
+    throw new Error(
+      `Unable to extract ${reportType} report count from: "${statusText}"`
+    );
+  }
+
+  return Number(countMatch[1]);
+}
+
+/** Reload the related list until the report count reaches `expected`. */
+async function waitForReportCount(
+  page: Page,
+  reportType: 'Consumer' | 'Commercial',
+  before: number,
+  expected: number
+): Promise<number> {
+  let current = before;
+
+  await expect
+    .poll(
+      async () => {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        current = await getReportCount(page, reportType);
+
+        console.log(
+          `${reportType} Reports: before=${before}, current=${current}, expected minimum=${expected}`
+        );
+
+        return current;
+      },
+      { timeout: 180000, intervals: [2000, 3000, 5000] }
+    )
+    .toBeGreaterThanOrEqual(expected);
+
+  return current;
+}
+
+async function getAvailableConsumerContactCount(
+  frame: FrameLocator
+): Promise<number> {
+  // One round trip instead of one per cell.
+  const texts = await frame
+    .locator('table tbody tr td:nth-child(2)')
+    .allTextContents();
+
+  const validNameCount = texts.filter((text) => {
+    const trimmed = text.trim();
+    return trimmed && trimmed.toUpperCase() !== 'NAME';
+  }).length;
+
+  console.log(`Available Consumer contacts: ${validNameCount}`);
+  return validNameCount;
+}
+
+async function selectConsumerContacts(frame: FrameLocator): Promise<number> {
+  const checkboxes = frame.locator('input[type="checkbox"]');
+
+  await expect
+    .poll(() => checkboxes.count(), { timeout: 30000, intervals: [500, 1000] })
+    .toBeGreaterThan(1);
+
+  console.log(`Checkbox inputs found: ${await checkboxes.count()}`);
+
+  // First checkbox is "Select All".
+  const selectAll = checkboxes.first();
+  await expect(selectAll).toBeVisible({ timeout: 30000 });
+  await expect(selectAll).toBeEnabled({ timeout: 30000 });
+
+  if (!(await selectAll.isChecked())) {
+    await selectAll.check({ force: true });
+  }
+
+  // Counts evaluated in the browser in one call (visible + enabled rows only).
+  const countChecked = () =>
+    checkboxes.evaluateAll(
+      (els) =>
+        (els as HTMLInputElement[])
+          .slice(1)
+          .filter((el) => !el.disabled && el.offsetParent !== null && el.checked)
+          .length
+    );
+
+  await expect
+    .poll(countChecked, { timeout: 30000, intervals: [250, 500, 1000] })
+    .toBeGreaterThan(0);
+
+  // Pick up any row that Select All did not tick.
+  const uncheckedIndexes = await checkboxes.evaluateAll((els) =>
+    (els as HTMLInputElement[])
+      .map((el, index) => ({ el, index }))
+      .filter(
+        ({ el, index }) =>
+          index > 0 && !el.disabled && el.offsetParent !== null && !el.checked
+      )
+      .map(({ index }) => index)
+  );
+
+  for (const index of uncheckedIndexes) {
+    await checkboxes.nth(index).check({ force: true, timeout: 5000 });
+  }
+
+  const selectedCount = await countChecked();
+  console.log(`Total Consumer contacts selected: ${selectedCount}`);
+
+  return selectedCount;
+}
+async function getSuccessfulConsumerReportCount(
+  frame: FrameLocator
+): Promise<number> {
+  const rows = frame.locator('table tbody tr');
+  const rowCount = await rows.count();
+
+  let hitCount = 0;
+  let noHitCount = 0;
+
+  console.log(`Consumer result rows found: ${rowCount}`);
+
+  for (let index = 0; index < rowCount; index++) {
+    const row = rows.nth(index);
+    const cells = row.locator('td');
+    const cellCount = await cells.count();
+
+    if (cellCount < 3) {
+      continue;
+    }
+
+    const contactName = (
+      await cells.nth(1).innerText().catch(() => '')
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const requestStatus = (
+      await cells.nth(2).innerText().catch(() => '')
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!contactName || contactName.toUpperCase() === 'NAME') {
+      continue;
+    }
+
+    if (/^Hit$/i.test(requestStatus)) {
+      hitCount++;
+
+      console.log(
+        `Consumer result: Contact="${contactName}", Status="Hit"`
+      );
+    } else if (/^No Hit\b/i.test(requestStatus)) {
+      noHitCount++;
+
+      console.log(
+        `Consumer result: Contact="${contactName}", Status="No Hit"`
+      );
+    } else {
+      console.log(
+        `Consumer result: Contact="${contactName}", Status="${requestStatus}"`
+      );
+    }
+  }
+
+  console.log(
+    `Consumer request result: Hit=${hitCount}, No Hit=${noHitCount}`
+  );
+
+  return hitCount;
+}
+async function clickDoneAfterRequest(
+  page: Page,
+  testInfo: TestInfo
+): Promise<number> {
+  console.log(
+    'Waiting for Consumer report processing to complete'
+  );
+
+  const activeFrameElement = page
+    .locator(`${VF_FRAME}:visible`)
+    .last();
+
+  await expect(activeFrameElement).toBeVisible({
+    timeout: 60000,
+  });
+
+  const activeFrame = activeFrameElement.contentFrame();
+
+  const doneButton = activeFrame
+    .getByRole('button', { name: /^Done$/i })
+    .or(activeFrame.locator('input[value="Done"]'))
+    .first();
+
+  await expect(doneButton).toBeVisible({
+    timeout: 120000,
+  });
+
+  console.log(
+    'Consumer processing completed. Done button is visible.'
+  );
+
+  const successfulConsumerReportCount =
+    await getSuccessfulConsumerReportCount(activeFrame);
+
+  console.log(
+    `Successful Consumer reports expected: ${successfulConsumerReportCount}`
+  );
+
+  await doneButton.scrollIntoViewIfNeeded();
+
+const resultPageText = (
+  await activeFrame.locator('body').innerText().catch(() => '')
+)
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const hasNoHit = /\bNo Hit\b/i.test(resultPageText);
+
+await captureScreenshot(
+  page,
+  testInfo,
+  hasNoHit
+    ? 'consumer-no-hit-result'
+    : 'consumer-processing-complete'
+);
+
+  console.log('Clicking Done button...');
+
+  await doneButton.click({
+    force: true,
+  });
+
+  console.log('Done button clicked.');
+
+  return successfulConsumerReportCount;
+}
+
+async function getPageErrorText(page: Page): Promise<string | null> {
+  try {
+    const bodyText = await page.locator('body').innerText();
+
+    const match = bodyText.match(
+      /(Error|Exception|Unable|Failed|Invalid|404|Not Found|No content|No records|No data)/i
+    );
+
+    if (!match) return null;
+
+    return bodyText.replace(/\s+/g, ' ').trim().slice(0, 1500);
+  } catch {
+    return null;
+  }
+}
+
+async function captureReportDetails(
+  page: Page,
+  reportType: 'Consumer' | 'Commercial'
+): Promise<Record<string, string>> {
+  const bodyText = (await page.locator('body').innerText())
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const patterns: Record<string, RegExp> = {
+    'Equifax Report ID': new RegExp(
+      `Equifax ${reportType} Report ID\\s+([A-Za-z0-9-]+)`,
+      'i'
+    ),
+    Contact: /Contact\s+([A-Z0-9\s\-.,]+)/i,
+    Account: /Account\s+([A-Z0-9\s\-.,/&()]+)/i,
+    'Beacon Score': /Beacon Score\s+([0-9]+)/i,
+    'Credit Quality Rating': /Credit Quality Rating\s+([A-Za-z0-9\s\-.,]+)/i,
+  };
+
+  const extracted: Record<string, string> = { pageText: bodyText };
+
+  for (const [key, pattern] of Object.entries(patterns)) {
+    const match = bodyText.match(pattern);
+    if (match) extracted[key] = match[1].trim();
+  }
+
+  // Reuse the text we already have instead of reading the body a second time.
+  if (
+    /(Error|Exception|Unable|Failed|Invalid|404|Not Found|No content|No records|No data)/i.test(
+      bodyText
+    )
+  ) {
+    extracted.pageError = bodyText.slice(0, 1500);
+  }
+
+  return extracted;
+}
+
+function getNextRandomAccountName(previouslyTriedAccounts: Set<string>): string {
+  for (let attempt = 1; attempt <= 50; attempt++) {
+    const candidate = getRandomAccountName().trim();
+
+    if (candidate && !previouslyTriedAccounts.has(candidate.toLowerCase())) {
+      previouslyTriedAccounts.add(candidate.toLowerCase());
+      console.log(`Random Account selected: ${candidate}`);
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    'Unable to select a new random Account that was not already attempted.'
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Test                                                                */
+/* ------------------------------------------------------------------ */
+
+test(
+  'One click: login -> random account -> generate consumer report -> validate report',
+  async ({ page: initialPage }, testInfo) => {
+    test.setTimeout(600000);
+
+    const accountName = getNextRandomAccountName(new Set<string>());
+    console.log(`Selected random account from CSV: ${accountName}`);
+
+    /* STEP 1 - Login */
+    const page = await loginToSalesforce(initialPage);
+
+    /* STEP 2 - Account + Contacts */
+    const accountWasCreated = await searchAccountAndOpen(page, accountName);
+    const selectedAccountUrl = page.url();
+
+    console.log(
+      accountWasCreated
+        ? `New Account detected. Processing Contacts for: ${accountName}`
+        : `Existing Account detected. Checking for missing Contacts: ${accountName}`
+    );
+
+    await createContactsForAccount(page, accountName, selectedAccountUrl);
+    await captureScreenshot(page, testInfo, 'account-contacts-ready');
+
+    /* STEP 3 - Commercial Report count before Review Credit */
+    await openReportViewAll(page, /Equifax Commercial Reports/i);
+
+    const commercialReportCountBefore = await getReportCount(page, 'Commercial');
+    console.log(
+      `Commercial Reports before Review Credit: ${commercialReportCountBefore}`
+    );
+    await captureScreenshot(page, testInfo, 'commercial-reports-before');
+
+    /* STEP 4 - Return to Account */
+    await returnToAccount(page, accountName);
+
+    /* STEP 5 - Open Review Credit */
+    await clickAccountAction(page, /^Review Credit$/i);
+    console.log('Review Credit button clicked.');
+
+    /* STEP 6 - Review Credit iframe */
+    const { element: reviewFrameElement, frame } = getVfFrame(page);
+    await expect(reviewFrameElement).toBeVisible({ timeout: 60000 });
+    console.log('Review Credit iframe loaded.');
+    await captureScreenshot(page, testInfo, 'review-credit-start');
+
+    /* STEP 7 - Initial Go */
+    const goButton = frame
+      .getByRole('button', { name: /^Go$/i })
+      .or(frame.locator('input[value="Go"]'))
+      .first();
+
+    await expect(goButton).toBeVisible({ timeout: 30000 });
+    await goButton.click();
+    console.log('Initial Review Credit Go button clicked.');
+
+    /* STEP 8 - Optional Consumer contact selection */
+    const consumerReportHeading = frame
+      .getByRole('heading', { name: /request consumer credit reports/i })
+      .or(frame.getByText(/request consumer credit reports/i))
+      .first();
+
+    const creditReviewHeading = frame
+      .getByRole('heading', { name: /credit review/i })
+      .first();
+    const requiredFieldsError = frame
+      .getByText(/required fields are missing/i)
+      .first();
+    const databaseUpdateError = frame
+      .getByText(/error occurred updating the salesforce database/i)
+      .first();
+
+    // Whichever shows first: consumer selection page, or a final response/error.
+    const firstScreen = await waitForOutcome({
+      consumerSelection: () =>
+        consumerReportHeading.waitFor({ state: 'visible', timeout: 15000 }),
+      response: () =>
+        creditReviewHeading
+          .or(requiredFieldsError)
+          .or(databaseUpdateError)
+          .first()
+          .waitFor({ state: 'visible', timeout: 15000 }),
+    });
+
+    if (firstScreen === 'consumerSelection') {
+      console.log('Review Credit displayed Consumer contact selection.');
+
+      const availableContactCount =
+        await getAvailableConsumerContactCount(frame);
+
+      if (availableContactCount === 0) {
+        const cancelButton = frame
+          .getByRole('button', { name: /^Cancel$/i })
+          .first();
+
+        if (await isVisible(cancelButton)) await cancelButton.click();
+
+        throw new Error(
+          `No Consumer contacts are available for Review Credit on account "${accountName}".`
+        );
+      }
+
+      const selectedContactCount = await selectConsumerContacts(frame);
+
+      if (selectedContactCount === 0) {
+        throw new Error(
+          'No Consumer contacts could be selected during Review Credit.'
+        );
+      }
+
+      console.log(
+        `${selectedContactCount} Consumer contact(s) selected during Review Credit.`
+      );
+
+      const consumerGoButton = frame
+        .getByRole('button', { name: /^Go$/i })
+        .or(frame.locator('input[value="Go"]'))
+        .first();
+
+      await expect(consumerGoButton).toBeVisible({ timeout: 30000 });
+      await consumerGoButton.click();
+      console.log('Consumer contact selection Go button clicked.');
+    }
+
+    /* STEP 9 - Wait for response page or application error */
+    await expect(
+      creditReviewHeading.or(requiredFieldsError).or(databaseUpdateError).first()
+    ).toBeVisible({ timeout: 120000 });
+
+    console.log('Review Credit response page loaded.');
+    await captureScreenshot(page, testInfo, 'review-credit-response');
+
+    /* STEP 10 - Read the response */
+    const reviewPageText = (
+      await frame.locator('body').innerText().catch(() => '')
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    console.log('Review Credit response:', reviewPageText.slice(0, 1500));
+
+    const requiredFieldsMatch = reviewPageText.match(
+      /Required fields are missing:\s*\[([^\]]+)\]/i
+    );
+
+    if (requiredFieldsMatch) {
+      console.log(
+        `Account "${accountName}" skipped. Missing field(s): ${requiredFieldsMatch[1]}`
+      );
+      return;
+    }
+
+    if (/error occurred updating the salesforce database/i.test(reviewPageText)) {
+      throw new Error('Review Credit failed while updating the Salesforce database.');
+    }
+
+    if (/error|exception|unable|failed|invalid/i.test(reviewPageText)) {
+      throw new Error(
+        `Review Credit failed. Response: ${reviewPageText.slice(0, 1500)}`
+      );
+    }
+
+    /* STEP 11 - Return to Account */
+    const returnToAccountButton = frame
+      .getByRole('button', { name: /return to account detail/i })
+      .or(frame.getByRole('link', { name: /return to account detail/i }))
+      .first();
+
+    await expect(returnToAccountButton).toBeVisible({ timeout: 60000 });
+    await returnToAccountButton.scrollIntoViewIfNeeded();
+    await returnToAccountButton.click();
+    console.log('Return to Account Detail clicked.');
+
+    /* STEP 12 - Confirm return */
+    await page.waitForURL(ACCOUNT_VIEW_URL, { timeout: 30000 });
+    await waitForAccountPage(page, accountName);
+    console.log('Review Credit completed and returned to Account.');
+
+    /* STEP 13-15 - Validate Commercial Report was created */
+    await openReportViewAll(page, /Equifax Commercial Reports/i);
+
+    const expectedCommercialReportCount = commercialReportCountBefore + 1;
+    console.log(
+      `Commercial Reports expected minimum count: ${expectedCommercialReportCount}`
+    );
+
+    const commercialReportCountAfter = await waitForReportCount(
+      page,
+      'Commercial',
+      commercialReportCountBefore,
+      expectedCommercialReportCount
+    );
+
+    console.log(
+      `Review Credit completed. Commercial Reports changed from ${commercialReportCountBefore} to ${commercialReportCountAfter}.`
+    );
+    await captureScreenshot(page, testInfo, 'commercial-reports-after');
+
+    /* ============ PART 2 - CONSUMER CREDIT REVIEW ============ */
+
+    /* STEP 16 - Back to Account */
+    await returnToAccount(page, accountName);
+    console.log('Returned to Account after Commercial Report validation.');
+
+    /* STEP 17 - Consumer Report count before */
+    await openReportViewAll(page, /Equifax Consumer Reports/i);
+
+    const consumerReportCountBefore = await getReportCount(page, 'Consumer');
+    console.log(
+      `Consumer Reports before Consumer Credit Review: ${consumerReportCountBefore}`
+    );
+    await captureScreenshot(page, testInfo, 'consumer-reports-before');
+
+    /* STEP 18 - Back to Account */
+    await returnToAccount(page, accountName);
+    console.log('Returned to Account before Consumer Credit Review.');
+
+    /* STEP 19 - Click Consumer Credit Review (direct or via Show More Actions) */
+    await clickAccountAction(page, /^Consumer Credit Review$/i);
+    console.log('Consumer Credit Review clicked.');
+
+    /* STEP 20 - Consumer iframe */
+    const { element: consumerFrameElement, frame: consumerFrame } =
+      getVfFrame(page);
+
+    await expect(consumerFrameElement).toBeVisible({ timeout: 60000 });
+    await waitForCreditReportPage(consumerFrame);
+    console.log('Request Consumer Credit Reports page loaded.');
+    await captureScreenshot(page, testInfo, 'consumer-request-page');
+
+    /* STEP 21 - Count available contacts */
+    const availableConsumerContactCount =
+      await getAvailableConsumerContactCount(consumerFrame);
+
+    if (availableConsumerContactCount === 0) {
+      const cancelButton = consumerFrame
+        .getByRole('button', { name: /^Cancel$/i })
+        .first();
+
+      if (await isVisible(cancelButton)) await cancelButton.click();
+
+      throw new Error(
+        `No Consumer contacts are available for account "${accountName}".`
+      );
+    }
+
+    /* STEP 22 - Select all contacts */
+    const selectedConsumerContactCount =
+      await selectConsumerContacts(consumerFrame);
+
+    if (selectedConsumerContactCount === 0) {
+      throw new Error('No Consumer contact checkboxes could be selected.');
+    }
+
+    if (selectedConsumerContactCount !== availableConsumerContactCount) {
+      throw new Error(
+        `Contact/checkbox mismatch. Contacts=${availableConsumerContactCount}, selected=${selectedConsumerContactCount}`
+      );
+    }
+
+    console.log(
+      `${selectedConsumerContactCount} Consumer contact(s) selected.`
+    );
+    await captureScreenshot(page, testInfo, 'consumer-contacts-selected');
+
+    /* STEP 23 - Request Reports */
+    const requestReportsButton = consumerFrame
+      .getByRole('button', { name: /request reports/i })
+      .or(consumerFrame.locator('input[value*="Request Reports" i]'))
+      .first();
+
+    await expect(requestReportsButton).toBeVisible({ timeout: 30000 });
+    await expect(requestReportsButton).toBeEnabled({ timeout: 30000 });
+    await requestReportsButton.click();
+    console.log('Request Reports clicked.');
+    await captureScreenshot(page, testInfo, 'consumer-request-submitted');
+
+    /* STEP 24 - Wait for processing and count successful Hits */
+    const successfulConsumerReportCount =
+      await clickDoneAfterRequest(page, testInfo);
+
+    const noHitConsumerCount =
+      selectedConsumerContactCount - successfulConsumerReportCount;
+
+    console.log(
+      `Consumer results: selected=${selectedConsumerContactCount}, ` +
+      `Hit=${successfulConsumerReportCount}, No Hit=${noHitConsumerCount}`
+    );
+
+    /* STEP 25 - Confirm return */
+    await page.waitForURL(ACCOUNT_VIEW_URL, { timeout: 60000 });
+    await waitForAccountPage(page, accountName);
+    console.log('Returned to Account after Consumer Credit Review.');
+
+    /* STEP 26-27 - Validate Consumer Reports persisted */
+    await openReportViewAll(page, /Equifax Consumer Reports/i);
+
+    const expectedConsumerReportCount =
+      consumerReportCountBefore + successfulConsumerReportCount;
+
+    console.log(
+      `Consumer Reports expected count: ${expectedConsumerReportCount}`
+    );
+
+    const consumerReportCountAfter = await waitForReportCount(
+      page,
+      'Consumer',
+      consumerReportCountBefore,
+      expectedConsumerReportCount
+    );
+    const generatedConsumerReportCount =
+      consumerReportCountAfter - consumerReportCountBefore;
+
+    expect(
+      generatedConsumerReportCount,
+      `Expected ${successfulConsumerReportCount} Consumer Report(s) ` +
+      `for Hit contacts, but ${generatedConsumerReportCount} were created.`
+    ).toBe(successfulConsumerReportCount);
+
+    console.log(
+      `Consumer Credit Review completed. Consumer Reports changed from ${consumerReportCountBefore} to ${consumerReportCountAfter}.`
+    );
+    await captureScreenshot(page, testInfo, 'consumer-reports-after');
+
+    // /* STEP 28 - Open newest Consumer Report (list sorted by Created Date desc) */
+    // const generatedConsumerLink = page
+    //   .getByRole('link', { name: /^EfxConsumer-\d+$/i })
+    //   .first();
+
+    // await expect(generatedConsumerLink).toBeVisible({ timeout: 30000 });
+
+    // const generatedConsumerReportName =
+    //   (await generatedConsumerLink.textContent())?.trim() ||
+    //   'EfxConsumer Report';
+
+    // console.log(`Opening Consumer Report: ${generatedConsumerReportName}`);
+    // await generatedConsumerLink.click();
+
+    // /* STEP 29 - Report detail page */
+    // await page.waitForURL('**/lightning/r/**', { timeout: 30000 });
+    // await page.waitForLoadState('domcontentloaded');
+
+    // // Wait for the record content to render rather than sleeping 3 seconds.
+    // await expect(page.locator('body')).toContainText(
+    //   /Equifax Consumer Report ID/i,
+    //   { timeout: 30000 }
+    // );
+
+    // await captureScreenshot(page, testInfo, 'consumer-report-detail');
+
+    // /* STEP 30 - Capture details */
+    // const finalReportValues = await captureReportDetails(page, 'Consumer');
+
+    // console.log(
+    //   'Final generated Consumer Report values:',
+    //   JSON.stringify(finalReportValues, null, 2)
+    // );
+
+    // /* STEP 31 - Save details */
+    // const outputPath = path.join(
+    //   process.cwd(),
+    //   'test-results',
+    //   'consumer-report-values.json'
+    // );
+
+    // fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    // fs.writeFileSync(outputPath, JSON.stringify(finalReportValues, null, 2));
+    // console.log(`Saved Consumer Report values to ${outputPath}`);
+
+    // /* STEP 32 - Validate */
+    // expect(
+    //   finalReportValues.pageText || finalReportValues.pageError
+    // ).toBeTruthy();
+    console.log(
+      'Consumer Credit Review validation completed.'
+    );
+
+    return;
+  }
+);
